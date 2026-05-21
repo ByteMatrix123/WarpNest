@@ -57,7 +57,7 @@ A SOCKS5 UDP proxy association bound to one selected WARP Instance for its lifet
 _Avoid_: UDP session, DNS shortcut
 
 **Proxy DNS Boundary**:
-The rule that target-name resolution for proxied traffic must stay inside the selected WARP Instance path rather than using the host system DNS as a shortcut.
+The rule that target-name resolution performed by WarpNest for proxied traffic must stay inside the selected WARP Instance path rather than using the host system DNS as a shortcut. If a client sends an already-resolved IP target, WarpNest cannot claim DNS protection for resolution that happened before the Proxy Endpoint received the request.
 _Avoid_: Local DNS fallback, pre-resolved proxy targets
 
 **Instance Selector**:
@@ -248,7 +248,11 @@ Domain expert: "No. SOCKS5 should support UDP Association, while HTTP proxy supp
 
 Developer: "Can WarpNest use host DNS to resolve proxy targets before connecting through WARP?"
 
-Domain expert: "No. The Proxy DNS Boundary requires target-name resolution to stay inside the selected WARP Instance path."
+Domain expert: "No. The Proxy DNS Boundary requires target-name resolution performed by WarpNest to stay inside the selected WARP Instance path."
+
+Developer: "Can WarpNest guarantee DNS privacy if a client sends an already-resolved IP address?"
+
+Domain expert: "No. WarpNest can preserve the Proxy DNS Boundary for hostnames and DNS UDP it receives, but it cannot undo client-side DNS resolution that happened before the request reached the Proxy Endpoint."
 
 Developer: "Is an Exit Probe the same thing as a Health Check?"
 
