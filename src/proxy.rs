@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    data_plane::{DataPlaneProtocol, DataPlaneRequest, MockDataPlane, UserSpaceDataPlane},
+    data_plane::{DataPlaneTarget, MockDataPlane, UdpDatagram, UserSpaceDataPlane},
     pool::ProxyPool,
     proxy_auth::{AuthConfig, ProxyCredentials, ProxyRequestError, resolve_proxy_request},
 };
@@ -138,31 +138,50 @@ async fn handle_socks5(
 
     match resolved {
         Ok(lease) if command == 0x01 => {
+            let data_plane_stream = data_plane
+                .connect_tcp(DataPlaneTarget {
+                    instance_id: lease.instance_id(),
+                    host: target_host,
+                    port: target_port,
+                })
+                .await;
+
+            let Ok(mut data_plane_stream) = data_plane_stream else {
+                stream
+                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await?;
+                drop(lease);
+                return Ok(());
+            };
+
             stream
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
                 .await?;
-            let response = data_plane
-                .send(DataPlaneRequest {
-                    protocol: DataPlaneProtocol::Tcp,
-                    instance_id: lease.instance_id(),
-                    target_host,
-                    target_port,
-                    payload: Vec::new(),
-                })
+            data_plane_stream.write_all(&[]).await?;
+            stream
+                .write_all(&data_plane_stream.read_once().await?)
                 .await?;
-            stream.write_all(&response.payload).await?;
             drop(lease);
         }
         Ok(lease) => {
             let relay = UdpSocket::bind("127.0.0.1:0").await?;
             let relay_addr = relay.local_addr()?;
+            let udp_session = match data_plane.open_udp_session(lease.instance_id()).await {
+                Ok(udp_session) => udp_session,
+                Err(_) => {
+                    stream
+                        .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await?;
+                    drop(lease);
+                    return Ok(());
+                }
+            };
             let mut reply = vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1];
             reply.extend_from_slice(&relay_addr.port().to_be_bytes());
             stream.write_all(&reply).await?;
 
-            let instance_id = lease.instance_id();
             let relay_task = tokio::spawn(async move {
-                let _ = serve_udp_association(relay, instance_id, data_plane).await;
+                let _ = serve_udp_association(relay, udp_session).await;
             });
 
             let mut drain = [0_u8; 1];
@@ -188,8 +207,7 @@ async fn handle_socks5(
 
 async fn serve_udp_association(
     relay: UdpSocket,
-    instance_id: String,
-    data_plane: Arc<dyn UserSpaceDataPlane>,
+    udp_session: Box<dyn crate::data_plane::DataPlaneUdpSession>,
 ) -> Result<()> {
     let mut buffer = vec![0_u8; 2048];
     loop {
@@ -197,16 +215,14 @@ async fn serve_udp_association(
         let Some(packet) = parse_socks5_udp_packet(&buffer[..len]) else {
             continue;
         };
-        let response = data_plane
-            .send(DataPlaneRequest {
-                protocol: DataPlaneProtocol::Udp,
-                instance_id: instance_id.clone(),
+        let response = udp_session
+            .send_datagram(UdpDatagram {
                 target_host: packet.host,
                 target_port: packet.port,
                 payload: packet.payload.to_vec(),
             })
             .await?;
-        relay.send_to(&response.payload, peer).await?;
+        relay.send_to(&response, peer).await?;
     }
 }
 
@@ -310,30 +326,45 @@ async fn handle_http(
     match resolved {
         Ok(lease) => {
             if request.starts_with("CONNECT ") {
+                let data_plane_stream = data_plane
+                    .connect_tcp(DataPlaneTarget {
+                        instance_id: lease.instance_id(),
+                        host: target.host,
+                        port: target.port,
+                    })
+                    .await;
+                let Ok(mut data_plane_stream) = data_plane_stream else {
+                    stream
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
+                        .await?;
+                    drop(lease);
+                    return Ok(());
+                };
+
                 stream
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
-                let response = data_plane
-                    .send(DataPlaneRequest {
-                        protocol: DataPlaneProtocol::Tcp,
-                        instance_id: lease.instance_id(),
-                        target_host: target.host,
-                        target_port: target.port,
-                        payload: Vec::new(),
-                    })
+                data_plane_stream.write_all(&[]).await?;
+                stream
+                    .write_all(&data_plane_stream.read_once().await?)
                     .await?;
-                stream.write_all(&response.payload).await?;
             } else {
-                let response = data_plane
-                    .send(DataPlaneRequest {
-                        protocol: DataPlaneProtocol::Tcp,
+                let data_plane_stream = data_plane
+                    .connect_tcp(DataPlaneTarget {
                         instance_id: lease.instance_id(),
-                        target_host: target.host,
-                        target_port: target.port,
-                        payload: Vec::new(),
+                        host: target.host,
+                        port: target.port,
                     })
-                    .await?;
-                let body = String::from_utf8(response.payload)?;
+                    .await;
+                let Ok(mut data_plane_stream) = data_plane_stream else {
+                    stream
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
+                        .await?;
+                    drop(lease);
+                    return Ok(());
+                };
+                data_plane_stream.write_all(&[]).await?;
+                let body = String::from_utf8(data_plane_stream.read_once().await?)?;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
                     body.len(),
