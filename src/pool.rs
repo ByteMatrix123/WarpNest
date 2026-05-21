@@ -122,6 +122,7 @@ impl ProxyPool {
             target_serving_size: self.config.target_serving_size,
             actual_serving_size,
             registration_budget: self.config.registration_budget,
+            recent_error: None,
             instances: self
                 .instances
                 .iter()
