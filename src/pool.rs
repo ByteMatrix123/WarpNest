@@ -1,4 +1,5 @@
 use crate::{
+    security::redact_sensitive,
     state_store::{PoolMembershipPreference, StoredWarpInstance},
     status::{InstanceStatus, PoolStatus, Readiness},
 };
@@ -136,7 +137,11 @@ impl ProxyPool {
                         current_exit_ip: instance.instance.last_observed_exit_ip.clone(),
                         last_observed_exit_ip: instance.instance.last_observed_exit_ip.clone(),
                         active_connections: instance.active_connections,
-                        recent_error: instance.instance.recent_error.clone(),
+                        recent_error: instance
+                            .instance
+                            .recent_error
+                            .as_ref()
+                            .map(|error| redact_sensitive(error)),
                     }
                 })
                 .collect(),

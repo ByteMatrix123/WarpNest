@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    security::redact_sensitive,
     state_store::{PoolMembershipPreference, StoredWarpInstance},
 };
 use serde::Serialize;
@@ -91,7 +92,7 @@ impl PoolStatus {
                     current_exit_ip: None,
                     last_observed_exit_ip: instance.last_observed_exit_ip,
                     active_connections: 0,
-                    recent_error: instance.recent_error,
+                    recent_error: instance.recent_error.map(|error| redact_sensitive(&error)),
                 })
                 .collect(),
         }
@@ -107,7 +108,7 @@ impl PoolStatus {
             target_serving_size,
             actual_serving_size: 0,
             registration_budget,
-            recent_error: Some(recent_error.into()),
+            recent_error: Some(redact_sensitive(&recent_error.into())),
             instances: Vec::new(),
         }
     }
