@@ -6,6 +6,7 @@ pub mod pool;
 pub mod probe;
 pub mod proxy;
 pub mod proxy_auth;
+pub mod public_warp_adapter;
 pub mod retry;
 pub mod security;
 pub mod state_store;
