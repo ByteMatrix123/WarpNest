@@ -93,7 +93,7 @@ The direct registration opt-in command is:
 ```sh
 WARPNEST_RUN_WARP_INTEGRATION=1 \
 WARPNEST_ACCEPT_PUBLIC_WARP_COMPAT_RISK=1 \
-cargo test --test direct_public_warp_registration opt_in_direct_registration_integration_uses_isolated_state_store -- --ignored
+cargo test --test public_warp_registration_harness opt_in_public_warp_registration_harness_reports_sanitized_evidence -- --ignored
 ```
 
 Default `cargo test` must not set these variables and must not contact Cloudflare.
