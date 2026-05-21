@@ -8,3 +8,4 @@ pub mod proxy_auth;
 pub mod retry;
 pub mod state_store;
 pub mod status;
+pub mod warp_lifecycle;

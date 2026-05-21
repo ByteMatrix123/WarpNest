@@ -185,6 +185,10 @@ impl StoredWarpInstance {
             recent_error: None,
         }
     }
+
+    pub fn redacted_registration_material(&self) -> &'static str {
+        "[redacted]"
+    }
 }
 
 impl PoolMembershipPreference {
