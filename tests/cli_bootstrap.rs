@@ -16,6 +16,7 @@ fn init_writes_default_configuration_file() {
     let config = std::fs::read_to_string(config_path).unwrap();
     assert!(config.contains("target_serving_size = 1"));
     assert!(config.contains("registration_budget = 3"));
+    assert!(config.contains("state_store_path = \"warpnest.sqlite\""));
     assert!(config.contains("management_bind = \"127.0.0.1:0\""));
 }
 
@@ -56,6 +57,7 @@ fn config_validation_rejects_public_management_api_without_authentication() {
         r#"
 target_serving_size = 1
 registration_budget = 3
+state_store_path = "warpnest.sqlite"
 
 [listeners]
 management_bind = "0.0.0.0:8080"
