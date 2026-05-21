@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod data_plane;
 pub mod management;
 pub mod pool;
 pub mod probe;
