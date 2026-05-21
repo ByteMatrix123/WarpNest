@@ -10,6 +10,7 @@ pub mod proxy;
 pub mod proxy_auth;
 pub mod public_warp_adapter;
 pub mod public_warp_registration_harness;
+pub mod real_warp_integration;
 pub mod retry;
 pub mod security;
 pub mod state_store;
