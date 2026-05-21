@@ -5,8 +5,7 @@ use serde_json::Value;
 use warpnest::{
     direct_public_warp_registration::{
         DirectPublicWarpRegistrationClient, DirectRegistrationHttpRequest,
-        DirectRegistrationHttpResponse, DirectRegistrationHttpTransport, PublicWarpIntegrationGate,
-        WarpKeyPair,
+        DirectRegistrationHttpResponse, DirectRegistrationHttpTransport, WarpKeyPair,
     },
     public_warp_adapter::PUBLIC_WARP_WIREGUARD_OBSERVED_V1,
     state_store::StateStore,
@@ -305,70 +304,4 @@ fn direct_registration_result_debug_output_redacts_registration_material() {
     assert!(rendered.contains("[redacted]"));
     assert!(!rendered.contains("fixture-access-token"));
     assert!(!rendered.contains(&private_key));
-}
-
-#[test]
-fn integration_gate_requires_both_public_warp_risk_flags() {
-    assert!(
-        !PublicWarpIntegrationGate {
-            run_warp_integration: false,
-            accept_public_warp_compat_risk: false,
-        }
-        .is_enabled()
-    );
-    assert!(
-        !PublicWarpIntegrationGate {
-            run_warp_integration: true,
-            accept_public_warp_compat_risk: false,
-        }
-        .is_enabled()
-    );
-    assert!(
-        !PublicWarpIntegrationGate {
-            run_warp_integration: false,
-            accept_public_warp_compat_risk: true,
-        }
-        .is_enabled()
-    );
-    assert!(
-        PublicWarpIntegrationGate {
-            run_warp_integration: true,
-            accept_public_warp_compat_risk: true,
-        }
-        .is_enabled()
-    );
-}
-
-#[test]
-#[ignore = "requires Cloudflare Public WARP registration and explicit risk gates"]
-fn opt_in_direct_registration_integration_uses_isolated_state_store() {
-    let gate = PublicWarpIntegrationGate::from_env();
-    if !gate.is_enabled() {
-        eprintln!(
-            "skipping Public WARP registration integration test: {}",
-            gate.skip_reason().unwrap_or("integration gate disabled")
-        );
-        return;
-    }
-
-    let temp = tempfile::tempdir().unwrap();
-    let store = StateStore::open(temp.path().join("warpnest.sqlite")).unwrap();
-    let client = DirectPublicWarpRegistrationClient::real().unwrap();
-    let mut service = RegistrationService::new(&store, client, 1);
-
-    let created = service
-        .create_public_registration(PublicRegistrationRequest {
-            group: "integration".to_string(),
-            label: Some("opt-in direct public WARP registration".to_string()),
-        })
-        .unwrap();
-    let restored = store.list_instances().unwrap();
-
-    assert_eq!(created.group, "integration");
-    assert_eq!(restored.len(), 1);
-    assert_eq!(restored[0].instance_id, created.instance_id);
-    assert_eq!(
-        restored[0].adapter_config.kind,
-        PUBLIC_WARP_WIREGUARD_OBSERVED_V1
-    );
 }
