@@ -2,7 +2,10 @@ use crate::{
     state_store::{PoolMembershipPreference, StoredWarpInstance},
     status::{InstanceStatus, PoolStatus, Readiness},
 };
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolConfig {
@@ -28,7 +31,7 @@ pub enum ScheduleError {
 #[derive(Debug)]
 pub struct ProxyPool {
     config: PoolConfig,
-    instances: Vec<Rc<RefCell<PoolInstance>>>,
+    instances: Vec<Arc<Mutex<PoolInstance>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +44,7 @@ struct PoolInstance {
 
 #[derive(Debug)]
 pub struct ConnectionLease {
-    instance: Rc<RefCell<PoolInstance>>,
+    instance: Arc<Mutex<PoolInstance>>,
 }
 
 impl PoolConfig {
@@ -86,7 +89,7 @@ impl ProxyPool {
                     }
                 };
 
-                Rc::new(RefCell::new(PoolInstance {
+                Arc::new(Mutex::new(PoolInstance {
                     instance,
                     pool_membership,
                     active_connections: 0,
@@ -103,7 +106,8 @@ impl ProxyPool {
             .instances
             .iter()
             .filter(|instance| {
-                instance.borrow().pool_membership == PoolMembershipPreference::Serving
+                instance.lock().expect("pool instance lock").pool_membership
+                    == PoolMembershipPreference::Serving
             })
             .count() as u16;
 
@@ -122,7 +126,7 @@ impl ProxyPool {
                 .instances
                 .iter()
                 .map(|instance| {
-                    let instance = instance.borrow();
+                    let instance = instance.lock().expect("pool instance lock");
                     InstanceStatus {
                         instance_id: instance.instance.instance_id.clone(),
                         group: instance.instance.group.clone(),
@@ -156,7 +160,7 @@ impl ProxyPool {
                 .instances
                 .iter()
                 .find(|instance| {
-                    let instance = instance.borrow();
+                    let instance = instance.lock().expect("pool instance lock");
                     instance.instance.instance_id == id
                         && matches!(
                             instance.pool_membership,
@@ -203,12 +207,12 @@ impl ProxyPool {
     fn best_candidate(
         &self,
         predicate: impl Fn(&PoolInstance) -> bool,
-    ) -> Option<Rc<RefCell<PoolInstance>>> {
+    ) -> Option<Arc<Mutex<PoolInstance>>> {
         self.instances
             .iter()
-            .filter(|instance| predicate(&instance.borrow()))
+            .filter(|instance| predicate(&instance.lock().expect("pool instance lock")))
             .min_by_key(|instance| {
-                let instance = instance.borrow();
+                let instance = instance.lock().expect("pool instance lock");
                 (instance.active_connections, instance.sequence)
             })
             .cloned()
@@ -216,19 +220,27 @@ impl ProxyPool {
 }
 
 impl ConnectionLease {
-    fn new(instance: Rc<RefCell<PoolInstance>>) -> Self {
-        instance.borrow_mut().active_connections += 1;
+    fn new(instance: Arc<Mutex<PoolInstance>>) -> Self {
+        instance
+            .lock()
+            .expect("pool instance lock")
+            .active_connections += 1;
         Self { instance }
     }
 
     pub fn instance_id(&self) -> String {
-        self.instance.borrow().instance.instance_id.clone()
+        self.instance
+            .lock()
+            .expect("pool instance lock")
+            .instance
+            .instance_id
+            .clone()
     }
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        let mut instance = self.instance.borrow_mut();
+        let mut instance = self.instance.lock().expect("pool instance lock");
         instance.active_connections = instance.active_connections.saturating_sub(1);
     }
 }
