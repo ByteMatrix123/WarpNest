@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    data_plane::{DataPlaneProtocol, DataPlaneRequest, MockDataPlane, UserSpaceDataPlane},
     pool::ProxyPool,
     proxy_auth::{AuthConfig, ProxyCredentials, ProxyRequestError, resolve_proxy_request},
 };
@@ -12,12 +13,12 @@ use tokio::{
     sync::Mutex,
 };
 
-#[derive(Debug)]
 pub struct ProxyRuntime {
     socks5: TcpListener,
     http: TcpListener,
     pool: Arc<Mutex<ProxyPool>>,
     auth: AuthConfig,
+    data_plane: Arc<dyn UserSpaceDataPlane>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,7 @@ impl ProxyRuntime {
             http,
             pool: Arc::new(Mutex::new(pool)),
             auth: AuthConfig::from_config(&config.auth),
+            data_plane: Arc::new(MockDataPlane),
         })
     }
 
@@ -52,18 +54,22 @@ impl ProxyRuntime {
     pub async fn serve(self) -> Result<()> {
         let socks5_pool = Arc::clone(&self.pool);
         let socks5_auth = self.auth.clone();
+        let socks5_data_plane = Arc::clone(&self.data_plane);
         let socks5 = serve_listener(self.socks5, move |stream| {
             let pool = Arc::clone(&socks5_pool);
             let auth = socks5_auth.clone();
-            async move { handle_socks5(stream, pool, auth).await }
+            let data_plane = Arc::clone(&socks5_data_plane);
+            async move { handle_socks5(stream, pool, auth, data_plane).await }
         });
 
         let http_pool = Arc::clone(&self.pool);
         let http_auth = self.auth;
+        let http_data_plane = Arc::clone(&self.data_plane);
         let http = serve_listener(self.http, move |stream| {
             let pool = Arc::clone(&http_pool);
             let auth = http_auth.clone();
-            async move { handle_http(stream, pool, auth).await }
+            let data_plane = Arc::clone(&http_data_plane);
+            async move { handle_http(stream, pool, auth, data_plane).await }
         });
 
         tokio::try_join!(socks5, http)?;
@@ -89,6 +95,7 @@ async fn handle_socks5(
     mut stream: TcpStream,
     pool: Arc<Mutex<ProxyPool>>,
     auth: AuthConfig,
+    data_plane: Arc<dyn UserSpaceDataPlane>,
 ) -> Result<()> {
     let version = read_u8(&mut stream).await?;
     if version != 0x05 {
@@ -134,9 +141,16 @@ async fn handle_socks5(
             stream
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
                 .await?;
-            let response =
-                mock_tcp_response("socks5", &lease.instance_id(), &target_host, target_port);
-            stream.write_all(response.as_bytes()).await?;
+            let response = data_plane
+                .send(DataPlaneRequest {
+                    protocol: DataPlaneProtocol::Tcp,
+                    instance_id: lease.instance_id(),
+                    target_host,
+                    target_port,
+                    payload: Vec::new(),
+                })
+                .await?;
+            stream.write_all(&response.payload).await?;
             drop(lease);
         }
         Ok(lease) => {
@@ -148,7 +162,7 @@ async fn handle_socks5(
 
             let instance_id = lease.instance_id();
             let relay_task = tokio::spawn(async move {
-                let _ = serve_udp_association(relay, instance_id).await;
+                let _ = serve_udp_association(relay, instance_id, data_plane).await;
             });
 
             let mut drain = [0_u8; 1];
@@ -172,15 +186,27 @@ async fn handle_socks5(
     Ok(())
 }
 
-async fn serve_udp_association(relay: UdpSocket, instance_id: String) -> Result<()> {
+async fn serve_udp_association(
+    relay: UdpSocket,
+    instance_id: String,
+    data_plane: Arc<dyn UserSpaceDataPlane>,
+) -> Result<()> {
     let mut buffer = vec![0_u8; 2048];
     loop {
         let (len, peer) = relay.recv_from(&mut buffer).await?;
         let Some(packet) = parse_socks5_udp_packet(&buffer[..len]) else {
             continue;
         };
-        let response = mock_udp_response(&instance_id, &packet.host, packet.port, packet.payload);
-        relay.send_to(response.as_bytes(), peer).await?;
+        let response = data_plane
+            .send(DataPlaneRequest {
+                protocol: DataPlaneProtocol::Udp,
+                instance_id: instance_id.clone(),
+                target_host: packet.host,
+                target_port: packet.port,
+                payload: packet.payload.to_vec(),
+            })
+            .await?;
+        relay.send_to(&response.payload, peer).await?;
     }
 }
 
@@ -269,6 +295,7 @@ async fn handle_http(
     mut stream: TcpStream,
     pool: Arc<Mutex<ProxyPool>>,
     auth: AuthConfig,
+    data_plane: Arc<dyn UserSpaceDataPlane>,
 ) -> Result<()> {
     let request = read_http_request(&mut stream).await?;
     let credentials =
@@ -286,16 +313,27 @@ async fn handle_http(
                 stream
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
-                let response = mock_tcp_response(
-                    "http-connect",
-                    &lease.instance_id(),
-                    &target.host,
-                    target.port,
-                );
-                stream.write_all(response.as_bytes()).await?;
+                let response = data_plane
+                    .send(DataPlaneRequest {
+                        protocol: DataPlaneProtocol::Tcp,
+                        instance_id: lease.instance_id(),
+                        target_host: target.host,
+                        target_port: target.port,
+                        payload: Vec::new(),
+                    })
+                    .await?;
+                stream.write_all(&response.payload).await?;
             } else {
-                let body =
-                    mock_tcp_response("http", &lease.instance_id(), &target.host, target.port);
+                let response = data_plane
+                    .send(DataPlaneRequest {
+                        protocol: DataPlaneProtocol::Tcp,
+                        instance_id: lease.instance_id(),
+                        target_host: target.host,
+                        target_port: target.port,
+                        payload: Vec::new(),
+                    })
+                    .await?;
+                let body = String::from_utf8(response.payload)?;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
                     body.len(),
@@ -386,17 +424,6 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
         }
     }
     Ok(String::from_utf8(bytes)?)
-}
-
-fn mock_tcp_response(protocol: &str, instance_id: &str, host: &str, port: u16) -> String {
-    format!("warpnest mock {protocol} instance={instance_id} target={host}:{port}\n")
-}
-
-fn mock_udp_response(instance_id: &str, host: &str, port: u16, payload: &[u8]) -> String {
-    format!(
-        "warpnest mock udp instance={instance_id} target={host}:{port} bytes={}\n",
-        payload.len()
-    )
 }
 
 fn socks5_error_code(error: ProxyRequestError) -> u8 {
