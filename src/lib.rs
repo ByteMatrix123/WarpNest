@@ -2,5 +2,6 @@ pub mod cli;
 pub mod config;
 pub mod management;
 pub mod pool;
+pub mod proxy_auth;
 pub mod state_store;
 pub mod status;
