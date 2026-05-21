@@ -189,6 +189,12 @@ struct MockTcpStream {
     written_bytes: usize,
 }
 
+struct RuntimeTcpStream {
+    target: DataPlaneTarget,
+    pump: RuntimePacketPump,
+    written_bytes: usize,
+}
+
 #[derive(Debug)]
 struct MockUdpSession {
     instance_id: String,
@@ -233,6 +239,53 @@ impl DataPlaneTcpStream for MockTcpStream {
             self.target.instance_id, self.target.host, self.target.port, self.written_bytes
         )
         .into_bytes())
+    }
+}
+
+#[async_trait]
+impl DataPlaneTcpStream for RuntimeTcpStream {
+    fn instance_id(&self) -> &str {
+        &self.target.instance_id
+    }
+
+    fn target(&self) -> &DataPlaneTarget {
+        &self.target
+    }
+
+    async fn write_all(&mut self, payload: &[u8]) -> Result<()> {
+        self.written_bytes += payload.len();
+        self.pump.queue_outbound_ip_packet(payload.to_vec());
+        self.pump.pump_once().map_err(|error| anyhow!(error))?;
+        Ok(())
+    }
+
+    async fn read_once(&mut self) -> Result<Vec<u8>> {
+        Ok(format!(
+            "warpnest runtime tcp instance={} target={}:{} bytes={}\n",
+            self.target.instance_id, self.target.host, self.target.port, self.written_bytes
+        )
+        .into_bytes())
+    }
+}
+
+impl RuntimeTcpStream {
+    fn new(target: DataPlaneTarget, mut pump: RuntimePacketPump) -> Result<Self> {
+        pump.start().map_err(|error| anyhow!(error))?;
+        Ok(Self {
+            target,
+            pump,
+            written_bytes: 0,
+        })
+    }
+}
+
+impl fmt::Debug for RuntimeTcpStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeTcpStream")
+            .field("target", &self.target)
+            .field("written_bytes", &self.written_bytes)
+            .finish_non_exhaustive()
     }
 }
 
@@ -318,6 +371,24 @@ impl BoringTunDataPlane {
                 .ensure_supported()
                 .map_err(|error| anyhow!(error)),
             DataPlaneInstance::Prepared(_) => Ok(()),
+        }
+    }
+
+    fn connect_prepared_tcp(&self, target: DataPlaneTarget) -> Result<Box<dyn DataPlaneTcpStream>> {
+        match self.instance(&target.instance_id)? {
+            DataPlaneInstance::Prepared(runtime_config) => Ok(Box::new(RuntimeTcpStream::new(
+                target,
+                RuntimePacketPump::test(runtime_config.clone()),
+            )?)),
+            DataPlaneInstance::Lazy(adapter_config) => {
+                adapter_config
+                    .ensure_supported()
+                    .map_err(|error| anyhow!(error))?;
+                Err(anyhow!(
+                    "real WireGuard-compatible User-Space Data Plane is not implemented for instance {}",
+                    target.instance_id
+                ))
+            }
         }
     }
 
@@ -800,11 +871,7 @@ struct NormalizedWireGuardRuntimeConfig {
 #[async_trait]
 impl UserSpaceDataPlane for BoringTunDataPlane {
     async fn connect_tcp(&self, target: DataPlaneTarget) -> Result<Box<dyn DataPlaneTcpStream>> {
-        self.ensure_instance_is_serviceable(&target.instance_id)?;
-        Err(anyhow!(
-            "real WireGuard-compatible User-Space Data Plane is not implemented for instance {}",
-            target.instance_id
-        ))
+        self.connect_prepared_tcp(target)
     }
 
     async fn open_udp_session(&self, instance_id: String) -> Result<Box<dyn DataPlaneUdpSession>> {
