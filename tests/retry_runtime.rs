@@ -58,6 +58,25 @@ fn permanent_policy_failure_blocks_without_retry() {
 }
 
 #[test]
+fn unsupported_failure_blocks_without_retry() {
+    let mut retry = RetryDiscipline::default();
+
+    let outcome = retry.record_failure(
+        OperationKind::Registration,
+        RetryError::Unsupported("unsupported public WARP material shape".to_string()),
+    );
+
+    assert_eq!(
+        outcome,
+        OperationOutcome::Blocked("unsupported public WARP material shape".to_string())
+    );
+    assert_eq!(
+        retry.next_retry(OperationKind::Registration),
+        OperationOutcome::Blocked("unsupported public WARP material shape".to_string())
+    );
+}
+
+#[test]
 fn concurrency_limits_are_tracked_per_operation_family() {
     let retry = RetryDiscipline::default();
 

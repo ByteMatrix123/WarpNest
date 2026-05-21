@@ -19,6 +19,7 @@ pub enum OperationKind {
 pub enum RetryError {
     Transient(String),
     Blocked(String),
+    Unsupported(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +116,7 @@ impl RetryDiscipline {
         error: RetryError,
     ) -> OperationOutcome {
         match error {
-            RetryError::Blocked(reason) => {
+            RetryError::Blocked(reason) | RetryError::Unsupported(reason) => {
                 self.blocked.insert(operation, reason.clone());
                 OperationOutcome::Blocked(reason)
             }

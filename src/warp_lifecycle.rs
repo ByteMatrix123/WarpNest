@@ -27,6 +27,7 @@ pub struct CreatedRegistration {
 pub enum RegistrationError {
     BudgetExceeded,
     Blocked(String),
+    Unsupported(String),
     Transient(String),
     Store(String),
 }
@@ -106,6 +107,13 @@ where
                 );
                 Err(RegistrationError::Blocked(reason))
             }
+            Err(RegistrationError::Unsupported(reason)) => {
+                self.retry.record_failure(
+                    OperationKind::Registration,
+                    RetryError::Unsupported(reason.clone()),
+                );
+                Err(RegistrationError::Unsupported(reason))
+            }
             Err(RegistrationError::Transient(reason)) => {
                 self.retry.record_failure(
                     OperationKind::Registration,
@@ -140,6 +148,12 @@ impl MockRegistrationClient {
     pub fn transient(reason: impl Into<String>) -> Self {
         Self {
             outcome: Err(RegistrationError::Transient(reason.into())),
+        }
+    }
+
+    pub fn unsupported(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: Err(RegistrationError::Unsupported(reason.into())),
         }
     }
 }
