@@ -4,8 +4,24 @@ use crate::public_warp_adapter::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use boringtun::{
+    noise::{Tunn, TunnResult},
+    x25519,
+};
 use serde::Deserialize;
-use std::{collections::BTreeMap, fmt, net::IpAddr, str::FromStr};
+use smoltcp::{
+    iface::{Config as SmoltcpConfig, Interface, SocketSet},
+    phy::{Device, Loopback, Medium, RxToken, TxToken},
+    time::Instant as SmoltcpInstant,
+    wire::{HardwareAddress, IpAddress, IpCidr},
+};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    error::Error,
+    fmt,
+    net::IpAddr,
+    str::FromStr,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPlaneRequest {
@@ -71,6 +87,63 @@ pub struct BoringTunRuntimeConfig {
     allowed_ips: Vec<IpNetwork>,
     dns_servers: Vec<IpAddr>,
     device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeLifecycleState {
+    Stopped,
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeTransportEvent {
+    SentToPeer(Vec<u8>),
+    DeliveredToStack(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePumpReport {
+    pub outbound_packets: usize,
+    pub inbound_packets: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimePacketPumpError {
+    AlreadyRunning,
+    NotRunning,
+    TransportFailed(String),
+    PacketEngineFailed(String),
+}
+
+pub struct RuntimePacketPump {
+    runtime_config: BoringTunRuntimeConfig,
+    lifecycle_state: RuntimeLifecycleState,
+    packet_engine: RuntimePacketEngine,
+    stack: RuntimeStack,
+    transport: TestRuntimeTransport,
+    inbound_wireguard_packets: VecDeque<Vec<u8>>,
+    last_error: Option<String>,
+}
+
+enum RuntimePacketEngine {
+    Fake(FakeWireGuardPacketEngine),
+    BoringTun(Box<Tunn>),
+}
+
+#[derive(Debug, Default)]
+struct FakeWireGuardPacketEngine;
+
+struct RuntimeStack {
+    interface: Interface,
+    device: Loopback,
+    delivered_packets: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+struct TestRuntimeTransport {
+    events: Vec<RuntimeTransportEvent>,
+    fail_next_send: Option<String>,
 }
 
 #[async_trait]
@@ -247,6 +320,12 @@ impl BoringTunDataPlane {
             DataPlaneInstance::Prepared(_) => Ok(()),
         }
     }
+
+    pub fn runtime_packet_pump(&self, instance_id: &str) -> Result<RuntimePacketPump> {
+        Ok(RuntimePacketPump::boringtun(
+            self.runtime_config(instance_id)?.clone(),
+        ))
+    }
 }
 
 impl BoringTunRuntimeConfig {
@@ -324,6 +403,308 @@ impl BoringTunRuntimeConfig {
 
     pub fn device_id(&self) -> Option<&str> {
         self.device_id.as_deref()
+    }
+}
+
+impl RuntimePacketPump {
+    pub fn test(runtime_config: BoringTunRuntimeConfig) -> Self {
+        Self::with_packet_engine(
+            runtime_config,
+            RuntimePacketEngine::Fake(Default::default()),
+        )
+    }
+
+    pub fn boringtun(runtime_config: BoringTunRuntimeConfig) -> Self {
+        Self::with_packet_engine(
+            runtime_config.clone(),
+            RuntimePacketEngine::BoringTun(Box::new(create_boringtun_engine(&runtime_config))),
+        )
+    }
+
+    fn with_packet_engine(
+        runtime_config: BoringTunRuntimeConfig,
+        packet_engine: RuntimePacketEngine,
+    ) -> Self {
+        Self {
+            stack: RuntimeStack::new(&runtime_config),
+            runtime_config,
+            lifecycle_state: RuntimeLifecycleState::Stopped,
+            packet_engine,
+            transport: TestRuntimeTransport::default(),
+            inbound_wireguard_packets: VecDeque::new(),
+            last_error: None,
+        }
+    }
+
+    pub fn start(&mut self) -> Result<(), RuntimePacketPumpError> {
+        if self.lifecycle_state == RuntimeLifecycleState::Running {
+            self.fail(RuntimePacketPumpError::AlreadyRunning)?;
+        }
+
+        self.lifecycle_state = RuntimeLifecycleState::Running;
+        self.last_error = None;
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), RuntimePacketPumpError> {
+        if self.lifecycle_state != RuntimeLifecycleState::Running {
+            self.lifecycle_state = RuntimeLifecycleState::Stopped;
+            return Ok(());
+        }
+
+        self.lifecycle_state = RuntimeLifecycleState::Stopped;
+        Ok(())
+    }
+
+    pub fn lifecycle(&self) -> RuntimeLifecycleState {
+        self.lifecycle_state
+    }
+
+    pub fn lifecycle_state(&self) -> &'static str {
+        match self.lifecycle_state {
+            RuntimeLifecycleState::Stopped => "stopped",
+            RuntimeLifecycleState::Running => "running",
+            RuntimeLifecycleState::Failed => "failed",
+        }
+    }
+
+    pub fn runtime_config(&self) -> &BoringTunRuntimeConfig {
+        &self.runtime_config
+    }
+
+    pub fn queue_outbound_ip_packet(&mut self, packet: Vec<u8>) {
+        self.stack.queue_outbound_packet(packet);
+    }
+
+    pub fn queue_inbound_wireguard_packet(&mut self, packet: Vec<u8>) {
+        self.inbound_wireguard_packets.push_back(packet);
+    }
+
+    pub fn pump_once(&mut self) -> Result<RuntimePumpReport, RuntimePacketPumpError> {
+        if self.lifecycle_state != RuntimeLifecycleState::Running {
+            self.fail(RuntimePacketPumpError::NotRunning)?;
+        }
+
+        let mut outbound_packets = 0;
+        let mut inbound_packets = 0;
+
+        while let Some(packet) = self.stack.next_outbound_packet() {
+            let datagram = match self.packet_engine.encapsulate(&packet) {
+                Ok(datagram) => datagram,
+                Err(error) => return self.fail(error),
+            };
+            if let Err(error) = self.transport.send_to_peer(datagram) {
+                return self.fail(error);
+            }
+            outbound_packets += 1;
+        }
+
+        while let Some(packet) = self.inbound_wireguard_packets.pop_front() {
+            let ip_packet = match self.packet_engine.decapsulate(&packet) {
+                Ok(ip_packet) => ip_packet,
+                Err(error) => return self.fail(error),
+            };
+            self.stack.deliver_from_wireguard(ip_packet.clone());
+            self.transport.deliver_to_stack(ip_packet);
+            inbound_packets += 1;
+        }
+
+        Ok(RuntimePumpReport {
+            outbound_packets,
+            inbound_packets,
+        })
+    }
+
+    pub fn transport_events(&self) -> &[RuntimeTransportEvent] {
+        &self.transport.events
+    }
+
+    pub fn delivered_stack_packets(&self) -> &[Vec<u8>] {
+        &self.stack.delivered_packets
+    }
+
+    pub fn fail_next_transport_send(&mut self, reason: impl Into<String>) {
+        self.transport.fail_next_send = Some(reason.into());
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    fn fail<T>(&mut self, error: RuntimePacketPumpError) -> Result<T, RuntimePacketPumpError> {
+        self.lifecycle_state = RuntimeLifecycleState::Failed;
+        self.last_error = Some(error.to_string());
+        Err(error)
+    }
+}
+
+impl RuntimePacketEngine {
+    fn encapsulate(&mut self, packet: &[u8]) -> Result<Vec<u8>, RuntimePacketPumpError> {
+        match self {
+            Self::Fake(engine) => engine.encapsulate(packet),
+            Self::BoringTun(tunn) => {
+                let mut dst = vec![0_u8; packet.len().saturating_add(256).max(2048)];
+                match tunn.encapsulate(packet, &mut dst) {
+                    TunnResult::WriteToNetwork(datagram) => Ok(datagram.to_vec()),
+                    TunnResult::Done => Ok(Vec::new()),
+                    TunnResult::Err(error) => Err(RuntimePacketPumpError::PacketEngineFailed(
+                        format!("{error:?}"),
+                    )),
+                    TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                        Err(RuntimePacketPumpError::PacketEngineFailed(
+                            "unexpected tunnel packet while encapsulating outbound IP packet"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    fn decapsulate(&mut self, packet: &[u8]) -> Result<Vec<u8>, RuntimePacketPumpError> {
+        match self {
+            Self::Fake(engine) => engine.decapsulate(packet),
+            Self::BoringTun(tunn) => {
+                let mut dst = vec![0_u8; packet.len().saturating_add(256).max(2048)];
+                match tunn.decapsulate(None, packet, &mut dst) {
+                    TunnResult::WriteToTunnelV4(ip_packet, _)
+                    | TunnResult::WriteToTunnelV6(ip_packet, _) => Ok(ip_packet.to_vec()),
+                    TunnResult::Done => Ok(Vec::new()),
+                    TunnResult::Err(error) => Err(RuntimePacketPumpError::PacketEngineFailed(
+                        format!("{error:?}"),
+                    )),
+                    TunnResult::WriteToNetwork(datagram) => Ok(datagram.to_vec()),
+                }
+            }
+        }
+    }
+}
+
+impl FakeWireGuardPacketEngine {
+    fn encapsulate(&mut self, packet: &[u8]) -> Result<Vec<u8>, RuntimePacketPumpError> {
+        Ok(packet.to_vec())
+    }
+
+    fn decapsulate(&mut self, packet: &[u8]) -> Result<Vec<u8>, RuntimePacketPumpError> {
+        Ok(packet.to_vec())
+    }
+}
+
+impl RuntimeStack {
+    fn new(runtime_config: &BoringTunRuntimeConfig) -> Self {
+        let mut device = Loopback::new(Medium::Ip);
+        let mut interface = Interface::new(
+            SmoltcpConfig::new(HardwareAddress::Ip),
+            &mut device,
+            SmoltcpInstant::ZERO,
+        );
+        interface.update_ip_addrs(|addresses| {
+            for address in runtime_config.interface_addresses() {
+                let cidr = IpCidr::new(IpAddress::from(address.address()), address.prefix_len());
+                let _ = addresses.push(cidr);
+            }
+        });
+
+        Self {
+            interface,
+            device,
+            delivered_packets: Vec::new(),
+        }
+    }
+
+    fn deliver_from_wireguard(&mut self, packet: Vec<u8>) {
+        if let Some(token) = self.device.transmit(SmoltcpInstant::ZERO) {
+            token.consume(packet.len(), |buffer| buffer.copy_from_slice(&packet));
+        }
+        if let Some((rx, _tx)) = self.device.receive(SmoltcpInstant::ZERO) {
+            self.delivered_packets
+                .push(rx.consume(|buffer| buffer.to_vec()));
+        }
+        let mut sockets = SocketSet::new(Vec::new());
+        let _ = self
+            .interface
+            .poll(SmoltcpInstant::ZERO, &mut self.device, &mut sockets);
+    }
+
+    fn queue_outbound_packet(&mut self, packet: Vec<u8>) {
+        if let Some(token) = self.device.transmit(SmoltcpInstant::ZERO) {
+            token.consume(packet.len(), |buffer| buffer.copy_from_slice(&packet));
+        }
+    }
+
+    fn next_outbound_packet(&mut self) -> Option<Vec<u8>> {
+        self.device
+            .receive(SmoltcpInstant::ZERO)
+            .map(|(rx, _tx)| rx.consume(|buffer| buffer.to_vec()))
+    }
+}
+
+impl TestRuntimeTransport {
+    fn send_to_peer(&mut self, packet: Vec<u8>) -> Result<(), RuntimePacketPumpError> {
+        if let Some(reason) = self.fail_next_send.take() {
+            return Err(RuntimePacketPumpError::TransportFailed(
+                redact_sensitive_text(&reason),
+            ));
+        }
+        self.events.push(RuntimeTransportEvent::SentToPeer(packet));
+        Ok(())
+    }
+
+    fn deliver_to_stack(&mut self, packet: Vec<u8>) {
+        self.events
+            .push(RuntimeTransportEvent::DeliveredToStack(packet));
+    }
+}
+
+impl fmt::Display for RuntimePacketPumpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyRunning => write!(formatter, "WARP Connection runtime is already running"),
+            Self::NotRunning => write!(formatter, "WARP Connection runtime is not running"),
+            Self::TransportFailed(reason) => {
+                write!(
+                    formatter,
+                    "WARP Connection runtime transport failed: {reason}"
+                )
+            }
+            Self::PacketEngineFailed(reason) => {
+                write!(
+                    formatter,
+                    "WARP Connection runtime packet engine failed: {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for RuntimePacketPumpError {}
+
+impl fmt::Debug for RuntimePacketPump {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimePacketPump")
+            .field("runtime_config", &self.runtime_config)
+            .field("lifecycle_state", &self.lifecycle_state)
+            .field("last_error", &self.last_error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for RuntimePacketEngine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fake(_) => formatter.write_str("FakeWireGuardPacketEngine"),
+            Self::BoringTun(_) => formatter.write_str("BoringTunPacketEngine"),
+        }
+    }
+}
+
+impl fmt::Debug for RuntimeStack {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeStack")
+            .field("delivered_packets", &self.delivered_packets.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -578,6 +959,35 @@ fn unsupported_adapter_config(
         kind: adapter_config.kind.clone(),
         version: adapter_config.version,
         reason: reason.into(),
+    }
+}
+
+fn create_boringtun_engine(runtime_config: &BoringTunRuntimeConfig) -> Tunn {
+    Tunn::new(
+        x25519::StaticSecret::from(*runtime_config.private_key().as_bytes()),
+        x25519::PublicKey::from(*runtime_config.peer_public_key().as_bytes()),
+        None,
+        None,
+        0,
+        None,
+    )
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    if value.trim().is_empty() {
+        "operation failed".to_string()
+    } else {
+        value
+            .split_whitespace()
+            .map(|token| {
+                if token.starts_with("private_key=") || token.starts_with("peer_public_key=") {
+                    "[redacted]".to_string()
+                } else {
+                    token.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 

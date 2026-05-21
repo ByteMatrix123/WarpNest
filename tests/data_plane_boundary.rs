@@ -2,7 +2,8 @@ use std::net::IpAddr;
 
 use warpnest::data_plane::{
     BoringTunDataPlane, DataPlaneInstanceConfig, DataPlaneProtocol, DataPlaneRequest,
-    DataPlaneTarget, IpNetwork, MockDataPlane, UdpDatagram, UserSpaceDataPlane,
+    DataPlaneTarget, IpNetwork, MockDataPlane, RuntimeLifecycleState, RuntimePacketPump,
+    RuntimePacketPumpError, RuntimeTransportEvent, UdpDatagram, UserSpaceDataPlane,
 };
 use warpnest::direct_public_warp_registration::WarpKeyPair;
 use warpnest::public_warp_adapter::{PUBLIC_WARP_WIREGUARD_OBSERVED_V1, PublicWarpAdapterConfig};
@@ -331,6 +332,138 @@ fn boringtun_runtime_config_debug_output_redacts_sensitive_material() {
     assert!(!rendered.contains(&private_key));
     assert!(!rendered.contains(&peer_public_key));
     assert!(!rendered.contains("fixture-device-id"));
+}
+
+#[test]
+fn runtime_packet_pump_moves_packets_through_injected_transport() {
+    let data_plane = runtime_data_plane(runtime_adapter_config()).unwrap();
+    let runtime_config = data_plane.runtime_config("instance-a").unwrap().clone();
+    let mut pump = RuntimePacketPump::test(runtime_config);
+
+    assert_eq!(pump.lifecycle_state(), "stopped");
+    pump.start().unwrap();
+    assert_eq!(pump.lifecycle_state(), "running");
+    pump.queue_outbound_ip_packet(vec![0x45, 0, 0, 20]);
+    pump.queue_inbound_wireguard_packet(vec![0x88, 0x99, 0xaa]);
+
+    let report = pump.pump_once().unwrap();
+
+    assert_eq!(report.outbound_packets, 1);
+    assert_eq!(report.inbound_packets, 1);
+    assert_eq!(
+        pump.transport_events(),
+        &[
+            RuntimeTransportEvent::SentToPeer(vec![0x45, 0, 0, 20]),
+            RuntimeTransportEvent::DeliveredToStack(vec![0x88, 0x99, 0xaa]),
+        ]
+    );
+    pump.stop().unwrap();
+    assert_eq!(pump.lifecycle_state(), "stopped");
+}
+
+#[test]
+fn runtime_packet_pump_keeps_multiple_instances_independent() {
+    let data_plane = BoringTunDataPlane::try_with_instances([
+        DataPlaneInstanceConfig {
+            instance_id: "instance-a".to_string(),
+            adapter_config: runtime_adapter_config(),
+        },
+        DataPlaneInstanceConfig {
+            instance_id: "instance-b".to_string(),
+            adapter_config: runtime_adapter_config_with(serde_json::json!({
+                "private_key": WarpKeyPair::from_private_key_bytes([27; 32]).private_key_base64(),
+                "interface_addresses": ["172.16.0.3/32"],
+                "peer_public_key": WarpKeyPair::from_private_key_bytes([28; 32]).public_key_base64(),
+                "peer_endpoint": "engage.cloudflareclient.com:2408",
+                "allowed_ips": ["0.0.0.0/0"],
+                "dns_servers": ["1.1.1.1"],
+                "device_id": "fixture-device-id-b",
+            })),
+        },
+    ])
+    .unwrap();
+    let mut pump_a =
+        RuntimePacketPump::test(data_plane.runtime_config("instance-a").unwrap().clone());
+    let mut pump_b =
+        RuntimePacketPump::test(data_plane.runtime_config("instance-b").unwrap().clone());
+
+    pump_a.start().unwrap();
+    pump_b.start().unwrap();
+    pump_a.queue_outbound_ip_packet(vec![0x45, 0, 0, 20, 0xa]);
+    pump_b.queue_outbound_ip_packet(vec![0x45, 0, 0, 20, 0xb]);
+
+    pump_a.pump_once().unwrap();
+    pump_b.pump_once().unwrap();
+
+    assert_ne!(
+        pump_a.runtime_config().device_id(),
+        pump_b.runtime_config().device_id()
+    );
+    assert_eq!(
+        pump_a.transport_events(),
+        &[RuntimeTransportEvent::SentToPeer(vec![0x45, 0, 0, 20, 0xa])]
+    );
+    assert_eq!(
+        pump_b.transport_events(),
+        &[RuntimeTransportEvent::SentToPeer(vec![0x45, 0, 0, 20, 0xb])]
+    );
+}
+
+#[test]
+fn runtime_packet_pump_reports_failures_without_sensitive_material() {
+    let mut pump = RuntimePacketPump::test(
+        runtime_data_plane(runtime_adapter_config())
+            .unwrap()
+            .runtime_config("instance-a")
+            .unwrap()
+            .clone(),
+    );
+
+    let not_running = pump.pump_once().unwrap_err();
+    assert_eq!(not_running, RuntimePacketPumpError::NotRunning);
+    assert_eq!(pump.lifecycle(), RuntimeLifecycleState::Failed);
+
+    pump.start().unwrap();
+    pump.queue_outbound_ip_packet(vec![0x45, 0, 0, 20]);
+    pump.fail_next_transport_send("private_key=super-secret peer_public_key=also-secret");
+    let transport_error = pump.pump_once().unwrap_err();
+    let rendered = transport_error.to_string();
+
+    assert!(matches!(
+        transport_error,
+        RuntimePacketPumpError::TransportFailed(_)
+    ));
+    assert_eq!(pump.lifecycle(), RuntimeLifecycleState::Failed);
+    assert!(rendered.contains("[redacted]"));
+    assert!(!rendered.contains("super-secret"));
+    assert!(!rendered.contains("also-secret"));
+}
+
+#[tokio::test]
+async fn boringtun_data_plane_with_prepared_runtime_still_defers_tcp_and_udp_support() {
+    let data_plane = runtime_data_plane(runtime_adapter_config()).unwrap();
+    let tcp_error = match data_plane
+        .connect_tcp(DataPlaneTarget {
+            instance_id: "instance-a".to_string(),
+            host: "example.test".to_string(),
+            port: 443,
+        })
+        .await
+    {
+        Ok(_) => panic!("expected TCP support to remain deferred"),
+        Err(error) => error.to_string(),
+    };
+    let udp_error = match data_plane.open_udp_session("instance-a".to_string()).await {
+        Ok(_) => panic!("expected UDP support to remain deferred"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(
+        tcp_error.contains("real WireGuard-compatible User-Space Data Plane is not implemented")
+    );
+    assert!(
+        udp_error.contains("real WireGuard-compatible User-Space Data Plane is not implemented")
+    );
 }
 
 #[tokio::test]
