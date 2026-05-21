@@ -48,6 +48,10 @@ impl AuthConfig {
         }
     }
 
+    pub fn requires_password(&self) -> bool {
+        self.shared_secret.is_some()
+    }
+
     fn authenticate(&self, credentials: &ProxyCredentials) -> bool {
         match &self.shared_secret {
             Some(secret) => credentials.password == *secret,
