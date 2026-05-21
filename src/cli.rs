@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     management::ManagementServer,
+    observed_warp_material::read_explicit_observed_warp_material_path,
     pool::{PoolConfig, ProxyPool},
     state_store::StateStore,
     status::PoolStatus,
@@ -34,6 +35,16 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         mock: bool,
+    },
+    ImportObserved {
+        #[arg(long, default_value = "warpnest.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        material: PathBuf,
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long)]
+        label: Option<String>,
     },
 }
 
@@ -73,6 +84,26 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 .context("failed to bind Management API")?;
             eprintln!("Management API listening on {}", server.local_addr()?);
             server.serve().await
+        }
+        Command::ImportObserved {
+            config,
+            material,
+            group,
+            label,
+        } => {
+            let config = Config::load(&config)?;
+            let store = StateStore::open(&config.state_store_path)?;
+            let observed = read_explicit_observed_warp_material_path(&material)?;
+            let imported = observed.import_into_store(&store, group, label.clone())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "instance_id": imported.instance_id,
+                    "group": imported.group,
+                    "label": label,
+                }))?
+            );
+            Ok(())
         }
     }
 }
