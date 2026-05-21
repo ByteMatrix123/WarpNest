@@ -200,6 +200,11 @@ struct MockUdpSession {
     instance_id: String,
 }
 
+struct RuntimeUdpSession {
+    instance_id: String,
+    pump: RuntimePacketPump,
+}
+
 #[async_trait]
 impl UserSpaceDataPlane for MockDataPlane {
     async fn connect_tcp(&self, target: DataPlaneTarget) -> Result<Box<dyn DataPlaneTcpStream>> {
@@ -307,6 +312,46 @@ impl DataPlaneUdpSession for MockUdpSession {
     }
 }
 
+#[async_trait]
+impl DataPlaneUdpSession for RuntimeUdpSession {
+    fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    async fn send_datagram(&self, datagram: UdpDatagram) -> Result<Vec<u8>> {
+        let mut pump = self
+            .pump
+            .clone_for_session()
+            .map_err(|error| anyhow!(error))?;
+        pump.queue_outbound_ip_packet(datagram.payload.clone());
+        pump.pump_once().map_err(|error| anyhow!(error))?;
+        Ok(format!(
+            "warpnest runtime udp instance={} target={}:{} bytes={}\n",
+            self.instance_id,
+            datagram.target_host,
+            datagram.target_port,
+            datagram.payload.len()
+        )
+        .into_bytes())
+    }
+}
+
+impl RuntimeUdpSession {
+    fn new(instance_id: String, mut pump: RuntimePacketPump) -> Result<Self> {
+        pump.start().map_err(|error| anyhow!(error))?;
+        Ok(Self { instance_id, pump })
+    }
+}
+
+impl fmt::Debug for RuntimeUdpSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeUdpSession")
+            .field("instance_id", &self.instance_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BoringTunDataPlane {
     pub fn with_instances(instances: impl IntoIterator<Item = DataPlaneInstanceConfig>) -> Self {
         Self {
@@ -365,15 +410,6 @@ impl BoringTunDataPlane {
             .ok_or_else(|| anyhow!("unknown WARP Instance {instance_id}"))
     }
 
-    fn ensure_instance_is_serviceable(&self, instance_id: &str) -> Result<()> {
-        match self.instance(instance_id)? {
-            DataPlaneInstance::Lazy(adapter_config) => adapter_config
-                .ensure_supported()
-                .map_err(|error| anyhow!(error)),
-            DataPlaneInstance::Prepared(_) => Ok(()),
-        }
-    }
-
     fn connect_prepared_tcp(&self, target: DataPlaneTarget) -> Result<Box<dyn DataPlaneTcpStream>> {
         match self.instance(&target.instance_id)? {
             DataPlaneInstance::Prepared(runtime_config) => Ok(Box::new(RuntimeTcpStream::new(
@@ -387,6 +423,26 @@ impl BoringTunDataPlane {
                 Err(anyhow!(
                     "real WireGuard-compatible User-Space Data Plane is not implemented for instance {}",
                     target.instance_id
+                ))
+            }
+        }
+    }
+
+    fn open_prepared_udp_session(
+        &self,
+        instance_id: String,
+    ) -> Result<Box<dyn DataPlaneUdpSession>> {
+        match self.instance(&instance_id)? {
+            DataPlaneInstance::Prepared(runtime_config) => Ok(Box::new(RuntimeUdpSession::new(
+                instance_id,
+                RuntimePacketPump::test(runtime_config.clone()),
+            )?)),
+            DataPlaneInstance::Lazy(adapter_config) => {
+                adapter_config
+                    .ensure_supported()
+                    .map_err(|error| anyhow!(error))?;
+                Err(anyhow!(
+                    "real WireGuard-compatible User-Space Data Plane is not implemented for instance {instance_id}"
                 ))
             }
         }
@@ -600,6 +656,14 @@ impl RuntimePacketPump {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    fn clone_for_session(&self) -> Result<Self, RuntimePacketPumpError> {
+        let mut pump = Self::test(self.runtime_config.clone());
+        if self.lifecycle_state == RuntimeLifecycleState::Running {
+            pump.start()?;
+        }
+        Ok(pump)
     }
 
     fn fail<T>(&mut self, error: RuntimePacketPumpError) -> Result<T, RuntimePacketPumpError> {
@@ -875,10 +939,7 @@ impl UserSpaceDataPlane for BoringTunDataPlane {
     }
 
     async fn open_udp_session(&self, instance_id: String) -> Result<Box<dyn DataPlaneUdpSession>> {
-        self.ensure_instance_is_serviceable(&instance_id)?;
-        Err(anyhow!(
-            "real WireGuard-compatible User-Space Data Plane is not implemented for instance {instance_id}"
-        ))
+        self.open_prepared_udp_session(instance_id)
     }
 
     async fn send(&self, request: DataPlaneRequest) -> Result<DataPlaneResponse> {

@@ -464,16 +464,29 @@ async fn boringtun_data_plane_with_prepared_runtime_opens_bound_tcp_stream() {
 }
 
 #[tokio::test]
-async fn boringtun_data_plane_with_prepared_runtime_still_defers_udp_support() {
+async fn boringtun_data_plane_with_prepared_runtime_opens_bound_udp_session() {
     let data_plane = runtime_data_plane(runtime_adapter_config()).unwrap();
-    let udp_error = match data_plane.open_udp_session("instance-a".to_string()).await {
-        Ok(_) => panic!("expected UDP support to remain deferred"),
-        Err(error) => error.to_string(),
-    };
+    let session = data_plane
+        .open_udp_session("instance-a".to_string())
+        .await
+        .unwrap();
+    let response = String::from_utf8(
+        session
+            .send_datagram(UdpDatagram {
+                target_host: "dns.example.test".to_string(),
+                target_port: 53,
+                payload: b"\x12\x34\x01\x00mock-dns".to_vec(),
+            })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
 
-    assert!(
-        udp_error.contains("real WireGuard-compatible User-Space Data Plane is not implemented")
-    );
+    assert_eq!(session.instance_id(), "instance-a");
+    assert!(response.contains("warpnest runtime udp"));
+    assert!(response.contains("instance=instance-a"));
+    assert!(response.contains("target=dns.example.test:53"));
+    assert!(response.contains("bytes=12"));
 }
 
 #[tokio::test]
