@@ -1,8 +1,11 @@
+use std::net::IpAddr;
+
 use warpnest::data_plane::{
     BoringTunDataPlane, DataPlaneInstanceConfig, DataPlaneProtocol, DataPlaneRequest,
-    DataPlaneTarget, MockDataPlane, UdpDatagram, UserSpaceDataPlane,
+    DataPlaneTarget, IpNetwork, MockDataPlane, UdpDatagram, UserSpaceDataPlane,
 };
-use warpnest::public_warp_adapter::PublicWarpAdapterConfig;
+use warpnest::direct_public_warp_registration::WarpKeyPair;
+use warpnest::public_warp_adapter::{PUBLIC_WARP_WIREGUARD_OBSERVED_V1, PublicWarpAdapterConfig};
 
 #[tokio::test]
 async fn mock_data_plane_preserves_instance_and_target_without_host_resolution() {
@@ -69,6 +72,43 @@ async fn mock_udp_session_binds_datagrams_to_one_instance() {
     assert!(body.contains("target=dns.example.test:53"));
 }
 
+fn runtime_adapter_config() -> PublicWarpAdapterConfig {
+    let private_key = WarpKeyPair::from_private_key_bytes([7; 32]);
+    let peer_key = WarpKeyPair::from_private_key_bytes([8; 32]);
+
+    runtime_adapter_config_with(serde_json::json!({
+        "private_key": private_key.private_key_base64(),
+        "interface_addresses": [
+            "172.16.0.2/32",
+            "2606:4700:110:8f24::2/128"
+        ],
+        "peer_public_key": peer_key.public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "allowed_ips": ["0.0.0.0/0", "::/0"],
+        "dns_servers": [
+            "1.1.1.1",
+            "1.0.0.1",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1001"
+        ],
+        "device_id": "fixture-device-id",
+    }))
+}
+
+fn runtime_adapter_config_with(config: serde_json::Value) -> PublicWarpAdapterConfig {
+    PublicWarpAdapterConfig::public_warp_wireguard_observed_v1(config).unwrap()
+}
+
+fn runtime_data_plane(
+    adapter_config: PublicWarpAdapterConfig,
+) -> Result<BoringTunDataPlane, String> {
+    BoringTunDataPlane::try_with_instances([DataPlaneInstanceConfig {
+        instance_id: "instance-a".to_string(),
+        adapter_config,
+    }])
+    .map_err(|error| error.to_string())
+}
+
 #[test]
 fn boringtun_skeleton_tracks_configured_warp_instances() {
     let data_plane = BoringTunDataPlane::with_instances([DataPlaneInstanceConfig {
@@ -79,6 +119,218 @@ fn boringtun_skeleton_tracks_configured_warp_instances() {
     assert_eq!(data_plane.instance_count(), 1);
     assert!(data_plane.has_instance("instance-a"));
     assert!(!data_plane.has_instance("instance-b"));
+}
+
+#[test]
+fn boringtun_prepares_direct_registration_runtime_config() {
+    let data_plane = runtime_data_plane(runtime_adapter_config()).unwrap();
+
+    let runtime_config = data_plane.runtime_config("instance-a").unwrap();
+
+    assert_eq!(runtime_config.private_key().as_bytes().len(), 32);
+    assert_eq!(runtime_config.peer_public_key().as_bytes().len(), 32);
+    assert_eq!(
+        runtime_config.interface_addresses(),
+        &[
+            "172.16.0.2/32".parse::<IpNetwork>().unwrap(),
+            "2606:4700:110:8f24::2/128".parse::<IpNetwork>().unwrap()
+        ]
+    );
+    assert_eq!(
+        runtime_config.peer_endpoint().host(),
+        "engage.cloudflareclient.com"
+    );
+    assert_eq!(runtime_config.peer_endpoint().port(), 2408);
+    assert_eq!(
+        runtime_config.allowed_ips(),
+        &[
+            "0.0.0.0/0".parse::<IpNetwork>().unwrap(),
+            "::/0".parse::<IpNetwork>().unwrap()
+        ]
+    );
+    assert_eq!(
+        runtime_config.dns_servers(),
+        &[
+            "1.1.1.1".parse::<IpAddr>().unwrap(),
+            "1.0.0.1".parse::<IpAddr>().unwrap(),
+            "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+            "2606:4700:4700::1001".parse::<IpAddr>().unwrap()
+        ]
+    );
+    assert_eq!(runtime_config.device_id(), Some("fixture-device-id"));
+}
+
+#[test]
+fn boringtun_prepares_observed_import_runtime_config_without_device_id() {
+    let data_plane = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": WarpKeyPair::from_private_key_bytes([17; 32]).private_key_base64(),
+        "interface_addresses": ["172.16.0.2/32"],
+        "peer_public_key": WarpKeyPair::from_private_key_bytes([18; 32]).public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "allowed_ips": ["0.0.0.0/0"],
+        "dns_servers": ["1.1.1.1"],
+    })))
+    .unwrap();
+
+    let runtime_config = data_plane.runtime_config("instance-a").unwrap();
+
+    assert_eq!(runtime_config.interface_addresses().len(), 1);
+    assert_eq!(runtime_config.allowed_ips().len(), 1);
+    assert_eq!(runtime_config.dns_servers().len(), 1);
+    assert_eq!(runtime_config.device_id(), None);
+}
+
+#[test]
+fn boringtun_runtime_config_rejects_malformed_keys() {
+    let error = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": "not-base64",
+        "interface_addresses": ["172.16.0.2/32"],
+        "peer_public_key": WarpKeyPair::from_private_key_bytes([8; 32]).public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "allowed_ips": ["0.0.0.0/0"],
+        "dns_servers": ["1.1.1.1"],
+    })))
+    .unwrap_err();
+
+    assert!(error.contains("unsupported Public WARP Adapter"));
+    assert!(error.contains("private_key"));
+    assert!(error.contains("base64"));
+    assert!(!error.contains("not-base64"));
+}
+
+#[test]
+fn boringtun_runtime_config_rejects_short_peer_public_keys() {
+    let short_peer_key =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8; 31]);
+    let error = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": WarpKeyPair::from_private_key_bytes([7; 32]).private_key_base64(),
+        "interface_addresses": ["172.16.0.2/32"],
+        "peer_public_key": short_peer_key,
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "allowed_ips": ["0.0.0.0/0"],
+        "dns_servers": ["1.1.1.1"],
+    })))
+    .unwrap_err();
+
+    assert!(error.contains("peer_public_key"));
+    assert!(error.contains("32 bytes"));
+    assert!(!error.contains(&short_peer_key));
+}
+
+#[test]
+fn boringtun_runtime_config_rejects_missing_peer_endpoint_port() {
+    let error = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": WarpKeyPair::from_private_key_bytes([7; 32]).private_key_base64(),
+        "interface_addresses": ["172.16.0.2/32"],
+        "peer_public_key": WarpKeyPair::from_private_key_bytes([8; 32]).public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com",
+        "allowed_ips": ["0.0.0.0/0"],
+        "dns_servers": ["1.1.1.1"],
+    })))
+    .unwrap_err();
+
+    assert!(error.contains("peer_endpoint"));
+    assert!(error.contains("missing a UDP port"));
+    assert!(!error.contains("engage.cloudflareclient.com"));
+}
+
+#[test]
+fn boringtun_runtime_config_rejects_malformed_interface_addresses() {
+    let error = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": WarpKeyPair::from_private_key_bytes([7; 32]).private_key_base64(),
+        "interface_addresses": ["172.16.0.2/33"],
+        "peer_public_key": WarpKeyPair::from_private_key_bytes([8; 32]).public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "allowed_ips": ["0.0.0.0/0"],
+        "dns_servers": ["1.1.1.1"],
+    })))
+    .unwrap_err();
+
+    assert!(error.contains("interface_addresses"));
+    assert!(error.contains("CIDR prefix length"));
+    assert!(!error.contains("172.16.0.2"));
+}
+
+#[test]
+fn boringtun_runtime_config_rejects_malformed_dns_servers() {
+    let error = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": WarpKeyPair::from_private_key_bytes([7; 32]).private_key_base64(),
+        "interface_addresses": ["172.16.0.2/32"],
+        "peer_public_key": WarpKeyPair::from_private_key_bytes([8; 32]).public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "allowed_ips": ["0.0.0.0/0"],
+        "dns_servers": ["dns.cloudflare.test"],
+    })))
+    .unwrap_err();
+
+    assert!(error.contains("dns_servers"));
+    assert!(!error.contains("dns.cloudflare.test"));
+}
+
+#[test]
+fn boringtun_runtime_config_rejects_missing_and_empty_fields() {
+    let missing_field_error = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": WarpKeyPair::from_private_key_bytes([7; 32]).private_key_base64(),
+        "interface_addresses": ["172.16.0.2/32"],
+        "peer_public_key": WarpKeyPair::from_private_key_bytes([8; 32]).public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "dns_servers": ["1.1.1.1"],
+    })))
+    .unwrap_err();
+    let empty_field_error = runtime_data_plane(runtime_adapter_config_with(serde_json::json!({
+        "private_key": "",
+        "interface_addresses": ["172.16.0.2/32"],
+        "peer_public_key": WarpKeyPair::from_private_key_bytes([8; 32]).public_key_base64(),
+        "peer_endpoint": "engage.cloudflareclient.com:2408",
+        "allowed_ips": ["0.0.0.0/0"],
+        "dns_servers": ["1.1.1.1"],
+    })))
+    .unwrap_err();
+
+    assert!(missing_field_error.contains("unsupported Public WARP Adapter"));
+    assert!(missing_field_error.contains("allowed_ips"));
+    assert!(empty_field_error.contains("private_key must not be empty"));
+}
+
+#[test]
+fn boringtun_runtime_config_rejects_unsupported_adapter_kind_and_version() {
+    let unsupported_kind = runtime_data_plane(
+        PublicWarpAdapterConfig::from_storage("future-adapter", 1, "{}").unwrap(),
+    )
+    .unwrap_err();
+    let unsupported_version = runtime_data_plane(
+        PublicWarpAdapterConfig::from_storage(PUBLIC_WARP_WIREGUARD_OBSERVED_V1, 2, "{}").unwrap(),
+    )
+    .unwrap_err();
+
+    assert!(unsupported_kind.contains("unsupported Public WARP Adapter future-adapter v1"));
+    assert!(
+        unsupported_version
+            .contains("unsupported Public WARP Adapter public_warp_wireguard_observed_v1 v2")
+    );
+}
+
+#[test]
+fn boringtun_runtime_config_debug_output_redacts_sensitive_material() {
+    let adapter_config = runtime_adapter_config();
+    let private_key = serde_json::from_str::<serde_json::Value>(adapter_config.config_json())
+        .unwrap()["private_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let peer_public_key = serde_json::from_str::<serde_json::Value>(adapter_config.config_json())
+        .unwrap()["peer_public_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let data_plane = runtime_data_plane(adapter_config).unwrap();
+
+    let rendered = format!("{:?}", data_plane.runtime_config("instance-a").unwrap());
+
+    assert!(rendered.contains("[redacted]"));
+    assert!(!rendered.contains(&private_key));
+    assert!(!rendered.contains(&peer_public_key));
+    assert!(!rendered.contains("fixture-device-id"));
 }
 
 #[tokio::test]

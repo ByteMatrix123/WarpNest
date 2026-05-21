@@ -14,7 +14,15 @@ pub struct PublicWarpAdapterConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicWarpAdapterError {
-    UnsupportedAdapter { kind: String, version: u16 },
+    UnsupportedAdapter {
+        kind: String,
+        version: u16,
+    },
+    UnsupportedAdapterConfig {
+        kind: String,
+        version: u16,
+        reason: String,
+    },
     Blocked(String),
 }
 
@@ -89,6 +97,16 @@ impl fmt::Display for PublicWarpAdapterError {
                 write!(
                     formatter,
                     "unsupported Public WARP Adapter {kind} v{version}"
+                )
+            }
+            Self::UnsupportedAdapterConfig {
+                kind,
+                version,
+                reason,
+            } => {
+                write!(
+                    formatter,
+                    "unsupported Public WARP Adapter {kind} v{version}: {reason}"
                 )
             }
             Self::Blocked(reason) => write!(formatter, "Public WARP Adapter blocked: {reason}"),
