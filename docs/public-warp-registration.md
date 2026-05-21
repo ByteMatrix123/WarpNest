@@ -88,6 +88,16 @@ Real-network verification for a direct Public WARP Registration client must be e
 
 Integration runs must use isolated temporary Configuration File and State Store paths, plus a bounded Registration Budget. Test output must be sanitized and must not print raw registration material, private keys, tokens, device identifiers, or normalized adapter config.
 
+The direct registration opt-in command is:
+
+```sh
+WARPNEST_RUN_WARP_INTEGRATION=1 \
+WARPNEST_ACCEPT_PUBLIC_WARP_COMPAT_RISK=1 \
+cargo test --test direct_public_warp_registration opt_in_direct_registration_integration_uses_isolated_state_store -- --ignored
+```
+
+Default `cargo test` must not set these variables and must not contact Cloudflare.
+
 After the direct registration compatibility mapping is implemented, these remaining observations must be proven and documented by opt-in real-network tests before the full real WARP path can be considered verified:
 
 - Which concrete remote failures are transient, blocked, or unsupported in real Cloudflare responses.
