@@ -88,9 +88,6 @@ fn blocked_readiness_is_reported_with_non_sensitive_error_summary() {
     let status = PoolStatus::blocked(2, 4, "authorization rejected: token redacted");
 
     assert_eq!(status.readiness, Readiness::Blocked);
-    assert_eq!(
-        status.recent_error.as_deref(),
-        Some("authorization rejected: token redacted")
-    );
+    assert_eq!(status.recent_error.as_deref(), Some("[redacted]"));
     assert!(serde_json::to_string(&status).unwrap().contains("blocked"));
 }
