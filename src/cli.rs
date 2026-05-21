@@ -1,5 +1,9 @@
 use crate::{
-    config::Config, management::ManagementServer, state_store::StateStore, status::PoolStatus,
+    config::Config,
+    management::ManagementServer,
+    pool::{PoolConfig, ProxyPool},
+    state_store::StateStore,
+    status::PoolStatus,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -51,11 +55,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 PoolStatus::mock(&config)
             } else {
                 let store = StateStore::open(&config.state_store_path)?;
-                PoolStatus::from_restored_instances(
-                    config.target_serving_size,
-                    config.registration_budget,
-                    store.list_instances()?,
-                )
+                restored_pool_status(&config, &store)?
             };
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
@@ -66,11 +66,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 PoolStatus::mock(&config)
             } else {
                 let store = StateStore::open(&config.state_store_path)?;
-                PoolStatus::from_restored_instances(
-                    config.target_serving_size,
-                    config.registration_budget,
-                    store.list_instances()?,
-                )
+                restored_pool_status(&config, &store)?
             };
             let server = ManagementServer::bind(config.listeners.management_bind, status)
                 .await
@@ -79,4 +75,10 @@ async fn run_cli(cli: Cli) -> Result<()> {
             server.serve().await
         }
     }
+}
+
+fn restored_pool_status(config: &Config, store: &StateStore) -> Result<PoolStatus> {
+    let pool_config = PoolConfig::new(config.target_serving_size, config.registration_budget);
+    let pool = ProxyPool::from_instances(pool_config, store.list_instances()?);
+    Ok(pool.status())
 }
