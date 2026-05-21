@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod data_plane;
 pub mod management;
+pub mod observed_warp_material;
 pub mod pool;
 pub mod probe;
 pub mod proxy;
