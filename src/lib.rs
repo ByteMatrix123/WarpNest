@@ -5,5 +5,6 @@ pub mod pool;
 pub mod probe;
 pub mod proxy;
 pub mod proxy_auth;
+pub mod retry;
 pub mod state_store;
 pub mod status;

@@ -10,6 +10,7 @@ pub struct PoolStatus {
     pub target_serving_size: u16,
     pub actual_serving_size: u16,
     pub registration_budget: u16,
+    pub recent_error: Option<String>,
     pub instances: Vec<InstanceStatus>,
 }
 
@@ -19,6 +20,7 @@ pub enum Readiness {
     Ready,
     Degraded,
     Unavailable,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -40,6 +42,7 @@ impl PoolStatus {
             target_serving_size: config.target_serving_size,
             actual_serving_size: 0,
             registration_budget: config.registration_budget,
+            recent_error: Some("mock WARP Instance is not connected".to_string()),
             instances: vec![InstanceStatus {
                 instance_id: "mock-instance-1".to_string(),
                 group: "default".to_string(),
@@ -77,6 +80,7 @@ impl PoolStatus {
             target_serving_size,
             actual_serving_size,
             registration_budget,
+            recent_error: None,
             instances: instances
                 .into_iter()
                 .map(|instance| InstanceStatus {
@@ -90,6 +94,21 @@ impl PoolStatus {
                     recent_error: instance.recent_error,
                 })
                 .collect(),
+        }
+    }
+
+    pub fn blocked(
+        target_serving_size: u16,
+        registration_budget: u16,
+        recent_error: impl Into<String>,
+    ) -> Self {
+        Self {
+            readiness: Readiness::Blocked,
+            target_serving_size,
+            actual_serving_size: 0,
+            registration_budget,
+            recent_error: Some(recent_error.into()),
+            instances: Vec::new(),
         }
     }
 }
