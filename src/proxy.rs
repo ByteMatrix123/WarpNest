@@ -51,6 +51,11 @@ impl ProxyRuntime {
         })
     }
 
+    pub fn with_data_plane(mut self, data_plane: Arc<dyn UserSpaceDataPlane>) -> Self {
+        self.data_plane = data_plane;
+        self
+    }
+
     pub async fn serve(self) -> Result<()> {
         let socks5_pool = Arc::clone(&self.pool);
         let socks5_auth = self.auth.clone();

@@ -440,27 +440,37 @@ fn runtime_packet_pump_reports_failures_without_sensitive_material() {
 }
 
 #[tokio::test]
-async fn boringtun_data_plane_with_prepared_runtime_still_defers_tcp_and_udp_support() {
+async fn boringtun_data_plane_with_prepared_runtime_opens_bound_tcp_stream() {
     let data_plane = runtime_data_plane(runtime_adapter_config()).unwrap();
-    let tcp_error = match data_plane
+    let mut stream = data_plane
         .connect_tcp(DataPlaneTarget {
             instance_id: "instance-a".to_string(),
-            host: "example.test".to_string(),
+            host: "api.example.test".to_string(),
             port: 443,
         })
         .await
-    {
-        Ok(_) => panic!("expected TCP support to remain deferred"),
-        Err(error) => error.to_string(),
-    };
+        .unwrap();
+
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let response = String::from_utf8(stream.read_once().await.unwrap()).unwrap();
+
+    assert_eq!(stream.instance_id(), "instance-a");
+    assert_eq!(stream.target().host, "api.example.test");
+    assert_eq!(stream.target().port, 443);
+    assert!(response.contains("warpnest runtime tcp"));
+    assert!(response.contains("instance=instance-a"));
+    assert!(response.contains("target=api.example.test:443"));
+    assert!(response.contains("bytes=18"));
+}
+
+#[tokio::test]
+async fn boringtun_data_plane_with_prepared_runtime_still_defers_udp_support() {
+    let data_plane = runtime_data_plane(runtime_adapter_config()).unwrap();
     let udp_error = match data_plane.open_udp_session("instance-a".to_string()).await {
         Ok(_) => panic!("expected UDP support to remain deferred"),
         Err(error) => error.to_string(),
     };
 
-    assert!(
-        tcp_error.contains("real WireGuard-compatible User-Space Data Plane is not implemented")
-    );
     assert!(
         udp_error.contains("real WireGuard-compatible User-Space Data Plane is not implemented")
     );
