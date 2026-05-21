@@ -1,6 +1,8 @@
 use warpnest::{
+    public_warp_adapter::{PUBLIC_WARP_WIREGUARD_OBSERVED_V1, PublicWarpAdapterConfig},
     retry::{OperationKind, OperationOutcome},
     state_store::StateStore,
+    status::PoolStatus,
     warp_lifecycle::{
         MockRegistrationClient, PublicRegistrationRequest, RegistrationError, RegistrationService,
     },
@@ -23,6 +25,59 @@ fn creates_public_warp_registration_and_persists_sensitive_material() {
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].instance_id, created.instance_id);
     assert_eq!(restored[0].redacted_registration_material(), "[redacted]");
+    assert_eq!(restored[0].adapter_config.kind, "mock");
+}
+
+#[test]
+fn creates_public_warp_registration_with_adapter_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("warpnest.sqlite");
+    let store = StateStore::open(&db_path).unwrap();
+    let adapter_config =
+        PublicWarpAdapterConfig::public_warp_wireguard_observed_v1(serde_json::json!({
+            "interface_addresses": ["172.16.0.2/32"],
+            "peer_endpoint": "engage.cloudflareclient.com:2408",
+            "private_key": "fixture-private-key"
+        }))
+        .unwrap();
+    let client = MockRegistrationClient::succeeds_with_adapter(
+        "{\"registration_material\":\"fixture-secret\"}",
+        adapter_config,
+    );
+    let mut service = RegistrationService::new(&store, client, 2);
+
+    let created = service
+        .create_public_registration(PublicRegistrationRequest::default())
+        .unwrap();
+
+    let restored = store.list_instances().unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].instance_id, created.instance_id);
+    assert_eq!(
+        restored[0].raw_registration_material(),
+        "{\"registration_material\":\"fixture-secret\"}"
+    );
+    assert_eq!(
+        restored[0].adapter_config.kind,
+        PUBLIC_WARP_WIREGUARD_OBSERVED_V1
+    );
+    assert_eq!(restored[0].adapter_config.version, 1);
+    assert!(
+        restored[0]
+            .adapter_config
+            .config_json()
+            .contains("peer_endpoint")
+    );
+
+    let rendered_status =
+        serde_json::to_string(&PoolStatus::from_restored_instances(1, 2, restored.clone()))
+            .unwrap();
+    let rendered_debug = format!("{:?}", restored[0]);
+    assert!(!rendered_status.contains("fixture-secret"));
+    assert!(!rendered_status.contains("fixture-private-key"));
+    assert!(!rendered_status.contains("adapter_config"));
+    assert!(!rendered_debug.contains("fixture-secret"));
+    assert!(!rendered_debug.contains("fixture-private-key"));
 }
 
 #[test]

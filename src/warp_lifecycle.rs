@@ -1,4 +1,5 @@
 use crate::{
+    public_warp_adapter::PublicWarpAdapterConfig,
     retry::{OperationKind, RetryDiscipline, RetryError},
     state_store::{
         InstanceLifecycleState, PoolMembershipPreference, StateStore, StoredWarpInstance,
@@ -15,6 +16,7 @@ pub struct PublicRegistrationRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicRegistration {
     pub registration_material: String,
+    pub adapter_config: PublicWarpAdapterConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,12 +88,13 @@ where
         match self.client.create_public_registration(&request) {
             Ok(registration) => {
                 self.retry.record_success(OperationKind::Registration);
-                let mut instance = StoredWarpInstance::new_mock(
+                let mut instance = StoredWarpInstance::new_with_adapter(
                     request.group,
                     None,
                     PoolMembershipPreference::Standby,
                     InstanceLifecycleState::Registered,
                     registration.registration_material,
+                    registration.adapter_config,
                 );
                 instance.label = request.label;
                 self.store.upsert_instance(&instance).map_err(store_error)?;
@@ -135,6 +138,19 @@ impl MockRegistrationClient {
         Self {
             outcome: Ok(PublicRegistration {
                 registration_material: registration_material.into(),
+                adapter_config: PublicWarpAdapterConfig::mock(),
+            }),
+        }
+    }
+
+    pub fn succeeds_with_adapter(
+        registration_material: impl Into<String>,
+        adapter_config: PublicWarpAdapterConfig,
+    ) -> Self {
+        Self {
+            outcome: Ok(PublicRegistration {
+                registration_material: registration_material.into(),
+                adapter_config,
             }),
         }
     }
