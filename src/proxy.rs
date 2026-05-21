@@ -8,7 +8,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::Mutex,
 };
 
@@ -115,7 +115,7 @@ async fn handle_socks5(
     let command = read_u8(&mut stream).await?;
     let _reserved = read_u8(&mut stream).await?;
     let address_type = read_u8(&mut stream).await?;
-    if version != 0x05 || command != 0x01 {
+    if version != 0x05 || !matches!(command, 0x01 | 0x03) {
         stream
             .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await?;
@@ -130,13 +130,35 @@ async fn handle_socks5(
     };
 
     match resolved {
-        Ok(lease) => {
+        Ok(lease) if command == 0x01 => {
             stream
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
                 .await?;
             let response =
                 mock_tcp_response("socks5", &lease.instance_id(), &target_host, target_port);
             stream.write_all(response.as_bytes()).await?;
+            drop(lease);
+        }
+        Ok(lease) => {
+            let relay = UdpSocket::bind("127.0.0.1:0").await?;
+            let relay_addr = relay.local_addr()?;
+            let mut reply = vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+            reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&reply).await?;
+
+            let instance_id = lease.instance_id();
+            let relay_task = tokio::spawn(async move {
+                let _ = serve_udp_association(relay, instance_id).await;
+            });
+
+            let mut drain = [0_u8; 1];
+            loop {
+                match stream.read(&mut drain).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            relay_task.abort();
             drop(lease);
         }
         Err(error) => {
@@ -148,6 +170,64 @@ async fn handle_socks5(
     }
 
     Ok(())
+}
+
+async fn serve_udp_association(relay: UdpSocket, instance_id: String) -> Result<()> {
+    let mut buffer = vec![0_u8; 2048];
+    loop {
+        let (len, peer) = relay.recv_from(&mut buffer).await?;
+        let Some(packet) = parse_socks5_udp_packet(&buffer[..len]) else {
+            continue;
+        };
+        let response = mock_udp_response(&instance_id, &packet.host, packet.port, packet.payload);
+        relay.send_to(response.as_bytes(), peer).await?;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Socks5UdpPacket<'a> {
+    host: String,
+    port: u16,
+    payload: &'a [u8],
+}
+
+fn parse_socks5_udp_packet(packet: &[u8]) -> Option<Socks5UdpPacket<'_>> {
+    if packet.len() < 7 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
+        return None;
+    }
+
+    match packet[3] {
+        0x01 => {
+            if packet.len() < 10 {
+                return None;
+            }
+            let host =
+                std::net::Ipv4Addr::new(packet[4], packet[5], packet[6], packet[7]).to_string();
+            let port = u16::from_be_bytes([packet[8], packet[9]]);
+            Some(Socks5UdpPacket {
+                host,
+                port,
+                payload: &packet[10..],
+            })
+        }
+        0x03 => {
+            let len = *packet.get(4)? as usize;
+            let host_start = 5;
+            let host_end = host_start + len;
+            let port_end = host_end + 2;
+            if packet.len() < port_end {
+                return None;
+            }
+            let host = String::from_utf8(packet[host_start..host_end].to_vec()).ok()?;
+            let port = u16::from_be_bytes([packet[host_end], packet[host_end + 1]]);
+            Some(Socks5UdpPacket {
+                host,
+                port,
+                payload: &packet[port_end..],
+            })
+        }
+        _ => None,
+    }
 }
 
 async fn read_socks5_credentials(stream: &mut TcpStream) -> Result<ProxyCredentials> {
@@ -310,6 +390,13 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
 
 fn mock_tcp_response(protocol: &str, instance_id: &str, host: &str, port: u16) -> String {
     format!("warpnest mock {protocol} instance={instance_id} target={host}:{port}\n")
+}
+
+fn mock_udp_response(instance_id: &str, host: &str, port: u16, payload: &[u8]) -> String {
+    format!(
+        "warpnest mock udp instance={instance_id} target={host}:{port} bytes={}\n",
+        payload.len()
+    )
 }
 
 fn socks5_error_code(error: ProxyRequestError) -> u8 {
