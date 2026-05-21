@@ -136,7 +136,10 @@ fn direct_registration_maps_wgcf_response_to_observed_adapter_config() {
     assert_eq!(requests[0].body["locale"], "en_US");
     assert_eq!(requests[0].body["model"], "PC");
     assert_eq!(requests[0].body["type"], "Android");
-    assert!(requests[0].body["tos"].as_str().is_some());
+    let tos = requests[0].body["tos"].as_str().unwrap();
+    assert!(tos.contains('T'));
+    assert!(tos.ends_with('Z'));
+    assert!(tos.parse::<u64>().is_err());
 }
 
 #[test]

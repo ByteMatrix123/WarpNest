@@ -6,7 +6,11 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
-use std::{collections::HashMap, env, fmt, time::SystemTime};
+use std::{
+    collections::HashMap,
+    env, fmt,
+    time::{Duration, SystemTime},
+};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const API_BASE_URL: &str = "https://api.cloudflareclient.com";
@@ -311,16 +315,47 @@ fn registration_request_body(key_pair: &WarpKeyPair) -> Value {
         "key": key_pair.public_key_base64(),
         "locale": DEFAULT_LOCALE,
         "model": DEFAULT_MODEL,
-        "tos": unix_timestamp_string(),
+        "tos": rfc3339_timestamp_string(),
         "type": "Android",
     })
 }
 
-fn unix_timestamp_string() -> String {
-    SystemTime::now()
+fn rfc3339_timestamp_string() -> String {
+    let duration = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+        .unwrap_or(Duration::ZERO);
+    let total_seconds = duration.as_secs();
+    let nanos = duration.subsec_nanos();
+    let days = (total_seconds / 86_400) as i64;
+    let seconds_of_day = total_seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    if nanos == 0 {
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    } else {
+        let fractional = format!("{nanos:09}");
+        let fractional = fractional.trim_end_matches('0');
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fractional}Z")
+    }
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+    let days = days_since_unix_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+
+    (year as i32, month as u32, day as u32)
 }
 
 fn classify_status(status: u16, body: &Value) -> Result<(), RegistrationError> {
