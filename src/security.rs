@@ -1,6 +1,13 @@
 use std::{fs, path::Path};
 
-const SECRET_PATTERNS: &[&str] = &["secret", "token", "private_key", "registration_material"];
+const SECRET_PATTERNS: &[&str] = &[
+    "secret",
+    "token",
+    "private_key",
+    "registration_material",
+    "raw_registration",
+    "adapter_config",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityWarning {
