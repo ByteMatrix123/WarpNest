@@ -13,7 +13,7 @@ pub struct PublicRegistrationRequest {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PublicRegistration {
     pub registration_material: String,
     pub adapter_config: PublicWarpAdapterConfig,
@@ -186,6 +186,16 @@ impl RegistrationClient for MockRegistrationClient {
 impl fmt::Debug for dyn RegistrationClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RegistrationClient")
+    }
+}
+
+impl fmt::Debug for PublicRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicRegistration")
+            .field("registration_material", &"[redacted]")
+            .field("adapter_config", &self.adapter_config)
+            .finish()
     }
 }
 
