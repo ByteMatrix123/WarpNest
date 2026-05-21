@@ -41,6 +41,18 @@ pub trait RegistrationClient {
     ) -> Result<PublicRegistration, RegistrationError>;
 }
 
+impl<C> RegistrationClient for &mut C
+where
+    C: RegistrationClient,
+{
+    fn create_public_registration(
+        &mut self,
+        request: &PublicRegistrationRequest,
+    ) -> Result<PublicRegistration, RegistrationError> {
+        (**self).create_public_registration(request)
+    }
+}
+
 pub struct RegistrationService<'a, C> {
     store: &'a StateStore,
     client: C,

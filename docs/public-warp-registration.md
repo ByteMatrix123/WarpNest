@@ -98,6 +98,14 @@ cargo test --test public_warp_registration_harness opt_in_public_warp_registrati
 
 Default `cargo test` must not set these variables and must not contact Cloudflare.
 
+The full real WARP path proof is also opt-in:
+
+```sh
+WARPNEST_RUN_WARP_INTEGRATION=1 \
+WARPNEST_ACCEPT_PUBLIC_WARP_COMPAT_RISK=1 \
+cargo test --test real_warp_full_path opt_in_full_real_warp_path_reports_sanitized_runtime_blocker -- --ignored --nocapture
+```
+
 After the direct registration compatibility mapping is implemented, these remaining observations must be proven and documented by opt-in real-network tests before the full real WARP path can be considered verified:
 
 - Which concrete remote failures are transient, blocked, or unsupported in real Cloudflare responses.
