@@ -22,6 +22,50 @@ The client output must be a complete WARP Registration result that can be stored
 
 Successful registration must map to the State Store exactly like imported observed material: raw material remains available for migration, normalized adapter config is versioned, and all sensitive fields remain redacted from status, logs, and `Debug` output. The registration client must not persist partial successful material outside the State Store.
 
+## wgcf-Derived Compatibility Mapping
+
+WarpNest accepts the `wgcf` public WARP registration behavior as the initial direct-registration compatibility baseline. This mapping is used only for ordinary Public WARP Scope and must remain isolated behind the `RegistrationClient` and Public WARP Adapter boundaries.
+
+The registration client should create a fresh WireGuard key pair locally and submit the public key to Cloudflare's public WARP registration endpoint:
+
+- Base URL: `https://api.cloudflareclient.com`
+- API version: `v0a1922`
+- Endpoint: `POST /v0a1922/reg`
+- Required compatibility headers:
+  - `User-Agent: okhttp/3.12.1`
+  - `CF-Client-Version: a-6.3-1922`
+- Transport compatibility:
+  - TLS must be constrained to TLS 1.2 for the direct client.
+  - HTTP/2 must be disabled for the direct client.
+
+The request body should match the ordinary public WARP registration shape observed by `wgcf`:
+
+```json
+{
+  "fcm_token": "",
+  "install_id": "",
+  "key": "<wireguard-public-key>",
+  "locale": "en_US",
+  "model": "PC",
+  "tos": "<timestamp>",
+  "type": "Android"
+}
+```
+
+WarpNest may allow the model and locale to become explicit configuration later, but the first implementation should keep the request narrow and deterministic. The request must not include WARP+, Zero Trust, organization-managed enrollment, identity-provider, or license-binding fields.
+
+The successful response must be preserved as raw Public WARP Registration material and normalized into `public_warp_wireguard_observed_v1`. The normalized adapter config must contain the same fields accepted by the observed-material import path:
+
+- `private_key`: the locally generated WireGuard private key.
+- `interface_addresses`: the IPv4 and IPv6 interface addresses from the registration response, without relying on host WARP client state.
+- `peer_public_key`: the first WARP peer public key from the registration response.
+- `peer_endpoint`: the first WARP peer endpoint host from the registration response.
+- `allowed_ips`: `0.0.0.0/0` and `::/0`.
+- `dns_servers`: `1.1.1.1`, `1.0.0.1`, `2606:4700:4700::1111`, and `2606:4700:4700::1001`.
+- `device_id`: the returned WARP device identifier when present.
+
+The raw material should retain response fields needed for recovery and future migrations, including the returned device identifier, access token, account data, interface configuration, peer configuration, and any unknown response fields. Logs, status output, test output, and `Debug` implementations must not print the raw material, private key, access token, device identifier, or normalized adapter config.
+
 ## Failure Taxonomy
 
 Direct registration failures must be classified before they reach Retry Discipline:
@@ -44,11 +88,9 @@ Real-network verification for a direct Public WARP Registration client must be e
 
 Integration runs must use isolated temporary Configuration File and State Store paths, plus a bounded Registration Budget. Test output must be sanitized and must not print raw registration material, private keys, tokens, device identifiers, or normalized adapter config.
 
-Before #27 can implement a direct registration client, these unknowns must be proven and documented:
+After the direct registration compatibility mapping is implemented, these remaining observations must be proven and documented by opt-in real-network tests before the full real WARP path can be considered verified:
 
-- The observed direct-registration request shape for ordinary public WARP.
-- The observed success response shape and its mapping to `public_warp_wireguard_observed_v1`.
-- Which remote failures are transient, blocked, or unsupported.
+- Which concrete remote failures are transient, blocked, or unsupported in real Cloudflare responses.
 - Whether the produced material can establish a real WARP Connection through the User-Space Data Plane without a host WARP client runtime dependency.
 
 ## Public WARP Adapter Contract
