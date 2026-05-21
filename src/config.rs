@@ -6,6 +6,7 @@ use std::{fs, net::SocketAddr, path::Path};
 pub struct Config {
     pub target_serving_size: u16,
     pub registration_budget: u16,
+    pub state_store_path: String,
     pub listeners: ListenerConfig,
     pub auth: AuthConfig,
 }
@@ -27,6 +28,7 @@ impl Default for Config {
         Self {
             target_serving_size: 1,
             registration_budget: 3,
+            state_store_path: "warpnest.sqlite".to_string(),
             listeners: ListenerConfig {
                 management_bind: "127.0.0.1:0".parse().expect("valid default address"),
                 socks5_bind: "127.0.0.1:1080".parse().expect("valid default address"),

@@ -1,4 +1,7 @@
-use crate::config::Config;
+use crate::{
+    config::Config,
+    state_store::{PoolMembershipPreference, StoredWarpInstance},
+};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -47,6 +50,46 @@ impl PoolStatus {
                 active_connections: 0,
                 recent_error: Some("mock WARP Instance is not connected".to_string()),
             }],
+        }
+    }
+
+    pub fn from_restored_instances(
+        target_serving_size: u16,
+        registration_budget: u16,
+        instances: Vec<StoredWarpInstance>,
+    ) -> Self {
+        let actual_serving_size = instances
+            .iter()
+            .filter(|instance| {
+                instance.enabled
+                    && instance.pool_membership_preference == PoolMembershipPreference::Serving
+            })
+            .count() as u16;
+
+        let readiness = match actual_serving_size {
+            0 => Readiness::Unavailable,
+            count if count < target_serving_size => Readiness::Degraded,
+            _ => Readiness::Ready,
+        };
+
+        Self {
+            readiness,
+            target_serving_size,
+            actual_serving_size,
+            registration_budget,
+            instances: instances
+                .into_iter()
+                .map(|instance| InstanceStatus {
+                    instance_id: instance.instance_id,
+                    group: instance.group,
+                    lifecycle_state: instance.lifecycle_state.as_str().to_string(),
+                    pool_membership: instance.pool_membership_preference.as_str().to_string(),
+                    current_exit_ip: None,
+                    last_observed_exit_ip: instance.last_observed_exit_ip,
+                    active_connections: 0,
+                    recent_error: instance.recent_error,
+                })
+                .collect(),
         }
     }
 }

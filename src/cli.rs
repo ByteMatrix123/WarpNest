@@ -1,5 +1,7 @@
-use crate::{config::Config, management::ManagementServer, status::PoolStatus};
-use anyhow::{Context, Result, bail};
+use crate::{
+    config::Config, management::ManagementServer, state_store::StateStore, status::PoolStatus,
+};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -45,19 +47,31 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
         Command::Status { config, mock } => {
             let config = Config::load(&config)?;
-            if !mock {
-                bail!("status currently requires --mock until the State Store is implemented");
-            }
-            let status = PoolStatus::mock(&config);
+            let status = if mock {
+                PoolStatus::mock(&config)
+            } else {
+                let store = StateStore::open(&config.state_store_path)?;
+                PoolStatus::from_restored_instances(
+                    config.target_serving_size,
+                    config.registration_budget,
+                    store.list_instances()?,
+                )
+            };
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
         }
         Command::Serve { config, mock } => {
             let config = Config::load(&config)?;
-            if !mock {
-                bail!("serve currently requires --mock until WARP Instances are implemented");
-            }
-            let status = PoolStatus::mock(&config);
+            let status = if mock {
+                PoolStatus::mock(&config)
+            } else {
+                let store = StateStore::open(&config.state_store_path)?;
+                PoolStatus::from_restored_instances(
+                    config.target_serving_size,
+                    config.registration_budget,
+                    store.list_instances()?,
+                )
+            };
             let server = ManagementServer::bind(config.listeners.management_bind, status)
                 .await
                 .context("failed to bind Management API")?;
